@@ -32,9 +32,11 @@ from qt.deletion_options import DeletionOptions
 from qt.se.details_dialog import DetailsDialog as DetailsDialogStandard
 from qt.me.details_dialog import DetailsDialog as DetailsDialogMusic
 from qt.pe.details_dialog import DetailsDialog as DetailsDialogPicture
+from qt.ve.details_dialog import DetailsDialog as DetailsDialogVideo
 from qt.se.preferences_dialog import PreferencesDialog as PreferencesDialogStandard
 from qt.me.preferences_dialog import PreferencesDialog as PreferencesDialogMusic
 from qt.pe.preferences_dialog import PreferencesDialog as PreferencesDialogPicture
+from qt.ve.preferences_dialog import PreferencesDialog as PreferencesDialogVideo
 from qt.pe.photo import File as PlatSpecificPhoto
 from qt.tabbed_window import TabBarWindow, TabWindow
 
@@ -193,6 +195,11 @@ class DupeGuru(QObject):
         self.model.options["scanned_tags"] = scanned_tags
         self.model.options["match_scaled"] = self.prefs.match_scaled
         self.model.options["match_rotated"] = self.prefs.match_rotated
+        self.model.options["duration_tolerance_seconds"] = self.prefs.video_duration_tolerance
+        self.model.options["frame_sample_count"] = self.prefs.video_frame_sample_count
+        self.model.options["ffmpeg_path"] = self.prefs.video_ffmpeg_path
+        self.model.options["ffprobe_path"] = self.prefs.video_ffprobe_path
+        self.model.options["video_match_scaled"] = self.prefs.video_match_scaled
         self.model.options["include_exists_check"] = self.prefs.include_exists_check
         self.model.options["rehash_ignore_mtime"] = self.prefs.rehash_ignore_mtime
 
@@ -205,6 +212,8 @@ class DupeGuru(QObject):
     def _get_details_dialog_class(self):
         if self.model.app_mode == AppMode.PICTURE:
             return DetailsDialogPicture
+        elif self.model.app_mode == AppMode.VIDEO:
+            return DetailsDialogVideo
         elif self.model.app_mode == AppMode.MUSIC:
             return DetailsDialogMusic
         else:
@@ -213,6 +222,8 @@ class DupeGuru(QObject):
     def _get_preferences_dialog_class(self):
         if self.model.app_mode == AppMode.PICTURE:
             return PreferencesDialogPicture
+        elif self.model.app_mode == AppMode.VIDEO:
+            return PreferencesDialogVideo
         elif self.model.app_mode == AppMode.MUSIC:
             return PreferencesDialogMusic
         else:

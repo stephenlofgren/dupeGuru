@@ -226,6 +226,11 @@ class Preferences(PreferencesBase):
         self.scan_tag_year = get("ScanTagYear", self.scan_tag_year)
         self.match_scaled = get("MatchScaled", self.match_scaled)
         self.match_rotated = get("MatchRotated", self.match_rotated)
+        self.video_duration_tolerance = get("VideoDurationTolerance", self.video_duration_tolerance)
+        self.video_frame_sample_count = get("VideoFrameSampleCount", self.video_frame_sample_count)
+        self.video_ffmpeg_path = get("VideoFfmpegPath", self.video_ffmpeg_path)
+        self.video_ffprobe_path = get("VideoFfprobePath", self.video_ffprobe_path)
+        self.video_match_scaled = get("VideoMatchScaled", self.video_match_scaled)
 
     def reset(self):
         self.filter_hardness = 95
@@ -279,6 +284,11 @@ class Preferences(PreferencesBase):
         self.scan_tag_year = False
         self.match_scaled = False
         self.match_rotated = False
+        self.video_duration_tolerance = 1.0
+        self.video_frame_sample_count = 5
+        self.video_ffmpeg_path = "ffmpeg"
+        self.video_ffprobe_path = "ffprobe"
+        self.video_match_scaled = True
 
     def _save_values(self, settings):
         set_ = self.set_value
@@ -333,11 +343,18 @@ class Preferences(PreferencesBase):
         set_("ScanTagYear", self.scan_tag_year)
         set_("MatchScaled", self.match_scaled)
         set_("MatchRotated", self.match_rotated)
+        set_("VideoDurationTolerance", self.video_duration_tolerance)
+        set_("VideoFrameSampleCount", self.video_frame_sample_count)
+        set_("VideoFfmpegPath", self.video_ffmpeg_path)
+        set_("VideoFfprobePath", self.video_ffprobe_path)
+        set_("VideoMatchScaled", self.video_match_scaled)
 
     # scan_type is special because we save it immediately when we set it.
     def get_scan_type(self, app_mode):
         if app_mode == AppMode.PICTURE:
             return self.get_value("ScanTypePicture", ScanType.FUZZYBLOCK)
+        elif app_mode == AppMode.VIDEO:
+            return self.get_value("ScanTypeVideo", ScanType.VIDEOLENGTH)
         elif app_mode == AppMode.MUSIC:
             return self.get_value("ScanTypeMusic", ScanType.TAG)
         else:
@@ -346,6 +363,8 @@ class Preferences(PreferencesBase):
     def set_scan_type(self, app_mode, value):
         if app_mode == AppMode.PICTURE:
             self.set_value("ScanTypePicture", value)
+        elif app_mode == AppMode.VIDEO:
+            self.set_value("ScanTypeVideo", value)
         elif app_mode == AppMode.MUSIC:
             self.set_value("ScanTypeMusic", value)
         else:

@@ -34,6 +34,7 @@ from qt.prioritize_dialog import PrioritizeDialog
 from qt.se.results_model import ResultsModel as ResultsModelStandard
 from qt.me.results_model import ResultsModel as ResultsModelMusic
 from qt.pe.results_model import ResultsModel as ResultsModelPicture
+from qt.ve.results_model import ResultsModel as ResultsModelVideo
 
 tr = trget("ui")
 
@@ -46,6 +47,8 @@ class ResultWindow(QMainWindow):
         self._setupUi()
         if app.model.app_mode == AppMode.PICTURE:
             MODEL_CLASS = ResultsModelPicture
+        elif app.model.app_mode == AppMode.VIDEO:
+            MODEL_CLASS = ResultsModelVideo
         elif app.model.app_mode == AppMode.MUSIC:
             MODEL_CLASS = ResultsModelMusic
         else:

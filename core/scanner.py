@@ -32,6 +32,10 @@ class ScanType:
     FUZZYBLOCK = 10
     EXIFTIMESTAMP = 11
 
+    # VE
+    VIDEOLENGTH = 20
+    VIDEOFRAMES = 21
+
 
 ScanOption = namedtuple("ScanOption", "scan_type label")
 

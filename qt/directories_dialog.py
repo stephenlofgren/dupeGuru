@@ -169,7 +169,11 @@ class DirectoriesDialog(QMainWindow):
         label = QLabel(tr("Application Mode:"), self)
         label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         hl.addWidget(label)
-        self.appModeRadioBox = RadioBox(self, items=[tr("Standard"), tr("Music"), tr("Picture")], spread=False)
+        self.appModeRadioBox = RadioBox(
+            self,
+            items=[tr("Standard"), tr("Music"), tr("Picture"), tr("Video")],
+            spread=False,
+        )
         hl.addWidget(self.appModeRadioBox)
         self.verticalLayout.addLayout(hl)
         hl = QHBoxLayout()
@@ -307,7 +311,9 @@ class DirectoriesDialog(QMainWindow):
         [self.recentFolders.insertItem(path) for path in paths]
 
     def appModeButtonSelected(self, index):
-        if index == 2:
+        if index == 3:
+            mode = AppMode.VIDEO
+        elif index == 2:
             mode = AppMode.PICTURE
         elif index == 1:
             mode = AppMode.MUSIC

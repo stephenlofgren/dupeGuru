@@ -23,7 +23,7 @@ from hscommon.util import delete_if_empty, first, escape, nonone, allsame
 from hscommon.trans import tr
 from hscommon import desktop
 
-from core import se, me, pe
+from core import se, me, pe, ve
 from core.pe.photo import get_delta_dimensions
 from core.util import cmp_value, fix_surrogate_encoding
 from core import directories, results, export, fs, prioritize
@@ -67,6 +67,7 @@ class AppMode:
     STANDARD = 0
     MUSIC = 1
     PICTURE = 2
+    VIDEO = 3
 
 
 JOBID2TITLE = {
@@ -174,6 +175,8 @@ class DupeGuru(Broadcaster):
             self.result_table.disconnect()
         if self.app_mode == AppMode.PICTURE:
             self.result_table = pe.result_table.ResultTable(self)
+        elif self.app_mode == AppMode.VIDEO:
+            self.result_table = ve.result_table.ResultTable(self)
         elif self.app_mode == AppMode.MUSIC:
             self.result_table = me.result_table.ResultTable(self)
         else:
@@ -186,7 +189,7 @@ class DupeGuru(Broadcaster):
         return op.join(self.appdata, cache_name)
 
     def _get_dupe_sort_key(self, dupe, get_group, key, delta):
-        if self.app_mode in (AppMode.MUSIC, AppMode.PICTURE) and key == "folder_path":
+        if self.app_mode in (AppMode.MUSIC, AppMode.PICTURE, AppMode.VIDEO) and key == "folder_path":
             dupe_folder_path = getattr(dupe, "display_folder_path", dupe.folder_path)
             return str(dupe_folder_path).lower()
         if self.app_mode == AppMode.PICTURE and delta and key == "dimensions":
@@ -212,7 +215,7 @@ class DupeGuru(Broadcaster):
         return result
 
     def _get_group_sort_key(self, group, key):
-        if self.app_mode in (AppMode.MUSIC, AppMode.PICTURE) and key == "folder_path":
+        if self.app_mode in (AppMode.MUSIC, AppMode.PICTURE, AppMode.VIDEO) and key == "folder_path":
             dupe_folder_path = getattr(group.ref, "display_folder_path", group.ref.folder_path)
             return str(dupe_folder_path).lower()
         if key == "percentage":
@@ -354,6 +357,8 @@ class DupeGuru(Broadcaster):
     def _get_fileclasses(self):
         if self.app_mode == AppMode.PICTURE:
             return [pe.photo.PLAT_SPECIFIC_PHOTO_CLASS]
+        elif self.app_mode == AppMode.VIDEO:
+            return [ve.fs.VideoFile]
         elif self.app_mode == AppMode.MUSIC:
             return [me.fs.MusicFile]
         else:
@@ -362,6 +367,8 @@ class DupeGuru(Broadcaster):
     def _prioritization_categories(self):
         if self.app_mode == AppMode.PICTURE:
             return pe.prioritize.all_categories()
+        elif self.app_mode == AppMode.VIDEO:
+            return ve.prioritize.all_categories()
         elif self.app_mode == AppMode.MUSIC:
             return me.prioritize.all_categories()
         else:
@@ -871,6 +878,8 @@ class DupeGuru(Broadcaster):
     def SCANNER_CLASS(self):
         if self.app_mode == AppMode.PICTURE:
             return pe.scanner.ScannerPE
+        elif self.app_mode == AppMode.VIDEO:
+            return ve.scanner.ScannerVE
         elif self.app_mode == AppMode.MUSIC:
             return me.scanner.ScannerME
         else:
@@ -880,6 +889,8 @@ class DupeGuru(Broadcaster):
     def METADATA_TO_READ(self):
         if self.app_mode == AppMode.PICTURE:
             return ["size", "mtime", "dimensions", "exif_timestamp"]
+        elif self.app_mode == AppMode.VIDEO:
+            return ["size", "mtime", "duration"]
         elif self.app_mode == AppMode.MUSIC:
             return [
                 "size",
