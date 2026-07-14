@@ -30,6 +30,7 @@ class ScannerVE(ScannerBase):
                 files,
                 threshold=self.min_match_percentage,
                 duration_tolerance_seconds=self.duration_tolerance_seconds,
+                j=j,
             )
         if self.scan_type == ScanType.VIDEOFRAMES:
             return matchframes.getmatches(
@@ -40,5 +41,6 @@ class ScannerVE(ScannerBase):
                 ffprobe_path=self.ffprobe_path,
                 duration_tolerance_seconds=self.duration_tolerance_seconds,
                 match_scaled=self.video_match_scaled,
+                j=j,
             )
         raise ValueError("Invalid scan type")

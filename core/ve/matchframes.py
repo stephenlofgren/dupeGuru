@@ -4,6 +4,9 @@ import tempfile
 from itertools import combinations
 from pathlib import Path
 
+from hscommon.jobprogress import job
+from hscommon.trans import tr
+
 from core.engine import Match
 from core.pe.block import DifferentBlockCountError, NoBlocksError, avgdiff
 from core.pe.matchblock import BLOCK_COUNT_PER_SIDE, MIN_ITERATIONS
@@ -62,13 +65,31 @@ def _sample_positions(sample_count):
     return [(i + 1) / (sample_count + 1) for i in range(sample_count)]
 
 
-def getmatches(files, threshold, sample_count, ffmpeg_path, ffprobe_path, duration_tolerance_seconds, match_scaled):
+def getmatches(
+    files,
+    threshold,
+    sample_count,
+    ffmpeg_path,
+    ffprobe_path,
+    duration_tolerance_seconds,
+    match_scaled,
+    j=job.nulljob,
+):
     _ensure_ffmpeg_available(ffmpeg_path, ffprobe_path)
+    j = j.start_subjob([2, 8])
+    for f in j.iter_with_progress(files, tr("Read duration of %d/%d videos")):
+        f.duration  # force lazy ffprobe read
+
     matches = []
-    for first, second in combinations(files, 2):
+    pair_count = len(files) * (len(files) - 1) // 2
+    j.start_job(max(1, pair_count), tr("Compared %d/%d video pairs") % (0, pair_count))
+    for i, (first, second) in enumerate(combinations(files, 2), start=1):
+        status = tr("Compared %d/%d video pairs (%s vs %s)") % (i, pair_count, first.name, second.name)
         if first.is_ref and second.is_ref:
+            j.set_progress(i, status)
             continue
         if duration_tolerance_seconds > 0 and abs(first.duration - second.duration) > duration_tolerance_seconds:
+            j.set_progress(i, status)
             continue
         sample_scores = []
         duration = min(first.duration, second.duration)
@@ -84,9 +105,9 @@ def getmatches(files, threshold, sample_count, ffmpeg_path, ffprobe_path, durati
                     logging.debug("Could not extract frame %d for %s and %s", idx, first.path, second.path)
                     continue
                 sample_scores.append(_frame_match_percentage(first_frame, second_frame, threshold, match_scaled))
-        if not sample_scores:
-            continue
-        percentage = int(sum(sample_scores) / len(sample_scores))
-        if percentage >= threshold:
-            matches.append(Match(first, second, percentage))
+        if sample_scores:
+            percentage = int(sum(sample_scores) / len(sample_scores))
+            if percentage >= threshold:
+                matches.append(Match(first, second, percentage))
+        j.set_progress(i, status)
     return matches
