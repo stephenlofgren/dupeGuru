@@ -22,6 +22,21 @@ VIDEO_EXTS = {
     "ts",
 }
 
+# Bare "ts" also matches TypeScript sources (get_file_ext uses the last dot only).
+# Reject known TS suffixes; multi-dot video names like "vacation.2024.01.15.ts" still match.
+NON_VIDEO_TS_SUFFIXES = (".d.ts", ".spec.ts", ".test.ts", ".stories.ts")
+
+
+def is_video_filename(name):
+    ext = get_file_ext(name)
+    if ext not in VIDEO_EXTS:
+        return False
+    if ext == "ts":
+        name_lower = name.lower()
+        if any(name_lower.endswith(suffix) for suffix in NON_VIDEO_TS_SUFFIXES):
+            return False
+    return True
+
 
 class VideoFile(fs.File):
     INITIAL_INFO = fs.File.INITIAL_INFO.copy()
@@ -31,7 +46,7 @@ class VideoFile(fs.File):
 
     @classmethod
     def can_handle(cls, path):
-        return fs.File.can_handle(path) and get_file_ext(path.name) in VIDEO_EXTS
+        return fs.File.can_handle(path) and is_video_filename(path.name)
 
     def _get_duration(self):
         ffprobe_path = self.__class__.ffprobe_path
@@ -55,7 +70,11 @@ class VideoFile(fs.File):
     def _read_info(self, field):
         fs.File._read_info(self, field)
         if field == "duration":
-            self.duration = self._get_duration()
+            try:
+                self.duration = self._get_duration()
+            except OSError:
+                # Cache failure so lazy reads do not re-run ffprobe on every pair comparison.
+                self.duration = 0.0
 
     def get_display_info(self, group, delta):
         size = self.size
