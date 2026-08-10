@@ -47,20 +47,47 @@ def _extract_frame(video_path, output_path, timestamp_seconds, ffmpeg_path):
 
 
 def _frame_match_percentage(first_image, second_image, threshold, match_scaled):
+    """Compare two frame image paths (used for later samples)."""
     photo_class = pe_photo.PLAT_SPECIFIC_PHOTO_CLASS
     if photo_class is None:
         raise OSError("Picture backend is not initialized; cannot run video frame comparisons.")
     first_photo = photo_class(first_image)
     second_photo = photo_class(second_image)
-    if not match_scaled and first_photo.dimensions != second_photo.dimensions:
+    return _pair_blocks_percentage(
+        first_photo.get_blocks(BLOCK_COUNT_PER_SIDE),
+        first_photo.dimensions,
+        second_photo.get_blocks(BLOCK_COUNT_PER_SIDE),
+        second_photo.dimensions,
+        threshold,
+        match_scaled,
+    )
+
+
+def _pair_blocks_percentage(first_blocks, first_dims, second_blocks, second_dims, threshold, match_scaled):
+    if first_blocks is None or second_blocks is None:
+        return 0
+    if not match_scaled and first_dims != second_dims:
         return 0
     try:
-        first_blocks = first_photo.get_blocks(BLOCK_COUNT_PER_SIDE)
-        second_blocks = second_photo.get_blocks(BLOCK_COUNT_PER_SIDE)
         diff = avgdiff(first_blocks, second_blocks, 100 - threshold, MIN_ITERATIONS)
         return max(0, 100 - diff)
     except (DifferentBlockCountError, NoBlocksError, OSError, ValueError):
         return 0
+
+
+def _blocks_for_frame(frame_path):
+    """Return (blocks, dimensions) for a cached frame image, or (None, None)."""
+    if frame_path is None:
+        return None, None
+    photo_class = pe_photo.PLAT_SPECIFIC_PHOTO_CLASS
+    if photo_class is None:
+        raise OSError("Picture backend is not initialized; cannot run video frame comparisons.")
+    try:
+        photo = photo_class(frame_path)
+        return photo.get_blocks(BLOCK_COUNT_PER_SIDE), photo.dimensions
+    except (OSError, ValueError, MemoryError) as e:
+        logging.debug("Could not prepare blocks for %s: %s", frame_path, e)
+        return None, None
 
 
 def _sample_positions(sample_count):
@@ -79,10 +106,14 @@ def _cannot_reach_threshold(scores, sample_count, threshold):
     return max_possible < threshold
 
 
-def _first_frame_worker_count(file_count):
-    if file_count <= 1:
+def _worker_count(item_count):
+    if item_count <= 1:
         return 1
-    return max(1, min(file_count, (os.cpu_count() or 4) * 2))
+    return max(1, min(item_count, (os.cpu_count() or 4) * 2))
+
+
+# Backwards-compatible alias used by tests.
+_first_frame_worker_count = _worker_count
 
 
 class _FrameCache:
@@ -108,28 +139,36 @@ class _FrameCache:
         self._frames[key] = path
         return path
 
+    def get_cached(self, video_file, sample_idx):
+        return self._frames.get((str(video_file.path), sample_idx))
+
     def preload_sample(self, files, sample_idx, relative_pos, j=job.nulljob):
         """Extract one sample index for every video, in parallel."""
+        self.preload_samples(files, [(sample_idx, relative_pos)], j=j)
+
+    def preload_samples(self, files, sample_positions, j=job.nulljob):
+        """Extract many (sample_idx, relative_pos) frames for every video, in parallel."""
         work = []
         for video_file in files:
-            key = (str(video_file.path), sample_idx)
-            if key in self._frames:
-                continue
-            out = self._cache_dir / f"{self._next_id}_{sample_idx}.jpg"
-            self._next_id += 1
-            ts = video_file.duration * relative_pos
-            work.append((key, video_file.path, out, ts))
+            for sample_idx, relative_pos in sample_positions:
+                key = (str(video_file.path), sample_idx)
+                if key in self._frames:
+                    continue
+                out = self._cache_dir / f"{self._next_id}_{sample_idx}.jpg"
+                self._next_id += 1
+                ts = video_file.duration * relative_pos
+                work.append((key, video_file.path, out, ts))
 
         if not work:
             return
 
-        j.start_job(len(work), tr("Extract first frame of %d/%d videos") % (0, len(work)))
-        workers = _first_frame_worker_count(len(work))
+        label = tr("Extract frames %d/%d")
+        j.start_job(len(work), label % (0, len(work)))
+        workers = _worker_count(len(work))
         done = 0
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
-                pool.submit(_extract_frame, path, out, ts, self._ffmpeg_path): (key, out)
-                for key, path, out, ts in work
+                pool.submit(_extract_frame, path, out, ts, self._ffmpeg_path): (key, out) for key, path, out, ts in work
             }
             for future in as_completed(futures):
                 key, out = futures[future]
@@ -137,13 +176,115 @@ class _FrameCache:
                 try:
                     ok = future.result()
                 except Exception:
-                    logging.debug("First-frame extract failed for %s", key[0], exc_info=True)
+                    logging.debug("Frame extract failed for %s sample %s", key[0], key[1], exc_info=True)
                 self._frames[key] = out if ok else None
                 done += 1
-                j.set_progress(done, tr("Extract first frame of %d/%d videos") % (done, len(work)))
+                j.set_progress(done, label % (done, len(work)))
 
 
-def _score_sample(frame_cache, first, second, sample_idx, relative_pos, threshold, match_scaled):
+def _prepare_frame_blocks(files, frame_cache, sample_indices, j=job.nulljob):
+    """Build (path, sample_idx) -> (blocks, dimensions) for cached frame images."""
+    prepared = {}
+    work = [(f, idx) for f in files for idx in sample_indices]
+    if not work:
+        return prepared
+
+    j.start_job(len(work), tr("Prepared frame blocks %d/%d") % (0, len(work)))
+    workers = _worker_count(len(work))
+
+    def prepare_one(item):
+        video_file, sample_idx = item
+        frame_path = frame_cache.get_cached(video_file, sample_idx)
+        return (str(video_file.path), sample_idx), _blocks_for_frame(frame_path)
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(prepare_one, item) for item in work]
+        for future in as_completed(futures):
+            key, blocks_dims = future.result()
+            prepared[key] = blocks_dims
+            done += 1
+            j.set_progress(done, tr("Prepared frame blocks %d/%d") % (done, len(work)))
+    return prepared
+
+
+def _first_frame_blocks_by_path(prepared_blocks):
+    """Map path -> (blocks, dims) for sample index 0."""
+    return {path: blocks_dims for (path, idx), blocks_dims in prepared_blocks.items() if idx == 0}
+
+
+def _score_first_frame_pairs(
+    pairs,
+    blocks_by_path,
+    threshold,
+    match_scaled,
+    sample_count,
+    pair_count=None,
+    j=job.nulljob,
+):
+    """Parallel first-frame scoring using precomputed blocks. Returns viable (a, b, score).
+
+    ``pairs`` may be a list or iterator. Pass ``pair_count`` when using a generator so
+    progress is accurate without materializing every pair in memory.
+    """
+    if pair_count is None:
+        pairs = list(pairs)
+        pair_count = len(pairs)
+
+    if pair_count <= 0:
+        j.start_job(1, tr("Compared %d/%d first-frame pairs") % (0, 0))
+        j.set_progress(1, tr("Compared %d/%d first-frame pairs") % (0, 0))
+        return []
+
+    j.start_job(pair_count, tr("Compared %d/%d first-frame pairs") % (0, pair_count))
+    workers = _worker_count(min(pair_count, 512))
+    viable = []
+    done = 0
+    chunk_size = max(workers * 32, 256)
+    pair_iter = iter(pairs)
+
+    def score_one(pair):
+        first, second = pair
+        first_blocks, first_dims = blocks_by_path.get(str(first.path), (None, None))
+        second_blocks, second_dims = blocks_by_path.get(str(second.path), (None, None))
+        score = _pair_blocks_percentage(first_blocks, first_dims, second_blocks, second_dims, threshold, match_scaled)
+        return first, second, score
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        while True:
+            chunk = []
+            try:
+                for _ in range(chunk_size):
+                    chunk.append(next(pair_iter))
+            except StopIteration:
+                pass
+            if not chunk:
+                break
+            futures = [pool.submit(score_one, pair) for pair in chunk]
+            for future in as_completed(futures):
+                first, second, score = future.result()
+                done += 1
+                if done % 100 == 0 or done >= pair_count:
+                    progress = min(done, pair_count)
+                    j.set_progress(
+                        progress,
+                        tr("Compared %d/%d first-frame pairs") % (progress, pair_count),
+                    )
+                if not _cannot_reach_threshold([score], sample_count, threshold):
+                    viable.append((first, second, score))
+        if done < pair_count:
+            j.set_progress(pair_count, tr("Compared %d/%d first-frame pairs") % (pair_count, pair_count))
+    return viable
+
+
+def _score_sample(frame_cache, first, second, sample_idx, relative_pos, threshold, match_scaled, prepared_blocks=None):
+    if prepared_blocks is not None:
+        first_blocks, first_dims = prepared_blocks.get((str(first.path), sample_idx), (None, None))
+        second_blocks, second_dims = prepared_blocks.get((str(second.path), sample_idx), (None, None))
+        if first_blocks is not None and second_blocks is not None:
+            return _pair_blocks_percentage(
+                first_blocks, first_dims, second_blocks, second_dims, threshold, match_scaled
+            )
     first_frame = frame_cache.get(first, sample_idx, relative_pos)
     second_frame = frame_cache.get(second, sample_idx, relative_pos)
     if first_frame is None or second_frame is None:
@@ -160,10 +301,12 @@ def getmatches(
     ffprobe_path,
     duration_tolerance_seconds,
     match_scaled,
+    preload_all_frames=False,
     j=job.nulljob,
 ):
     _ensure_ffmpeg_available(ffmpeg_path, ffprobe_path)
-    j = j.start_subjob([1, 2, 7])
+    # duration -> extract frames -> prepare blocks -> first-pass pairs -> deep samples
+    j = j.start_subjob([1, 3, 2, 3, 1] if preload_all_frames else [1, 2, 2, 3, 2])
     for f in j.iter_with_progress(files, tr("Read duration of %d/%d videos")):
         f.duration  # force lazy ffprobe read
 
@@ -171,32 +314,60 @@ def getmatches(
     files = [f for f in files if f.duration > 0]
     positions = _sample_positions(sample_count)
     matches = []
-    pair_count = duration_window_pair_count(files, duration_tolerance_seconds)
+    sample_indices = list(range(sample_count)) if preload_all_frames else [0]
 
     with tempfile.TemporaryDirectory(prefix="dupeguru-video-frames-") as td:
         frame_cache = _FrameCache(td, ffmpeg_path)
-        # Parallelize first-frame extracts only. Later samples stay serial and are
-        # only pulled for pairs that still look viable after the first comparison.
-        frame_cache.preload_sample(files, 0, positions[0], j=j)
+        if preload_all_frames:
+            frame_cache.preload_samples(files, list(enumerate(positions)), j=j)
+        else:
+            frame_cache.preload_sample(files, 0, positions[0], j=j)
 
-        for first, second in j.iter_with_progress(
-            iter_duration_window_pairs(files, duration_tolerance_seconds),
-            tr("Compared %d/%d video pairs"),
-            count=max(1, pair_count),
-            every=100,
+        prepared_blocks = _prepare_frame_blocks(files, frame_cache, sample_indices, j=j)
+        blocks_by_path = _first_frame_blocks_by_path(prepared_blocks)
+
+        pair_count = duration_window_pair_count(files, duration_tolerance_seconds)
+        candidate_pairs = (
+            (first, second)
+            for first, second in iter_duration_window_pairs(files, duration_tolerance_seconds)
+            if not (first.is_ref and second.is_ref)
+        )
+        viable = _score_first_frame_pairs(
+            candidate_pairs,
+            blocks_by_path,
+            threshold,
+            match_scaled,
+            sample_count,
+            pair_count=pair_count,
+            j=j,
+        )
+
+        deep_blocks = prepared_blocks if preload_all_frames else None
+        for first, second, first_score in j.iter_with_progress(
+            viable,
+            tr("Deep-compared %d/%d video pairs"),
+            count=max(1, len(viable)),
+            every=10,
         ):
-            if first.is_ref and second.is_ref:
-                continue
-
-            first_score = _score_sample(frame_cache, first, second, 0, positions[0], threshold, match_scaled)
             sample_scores = [first_score]
-            if _cannot_reach_threshold(sample_scores, sample_count, threshold):
+            if sample_count == 1:
+                percentage = int(first_score)
+                if percentage >= threshold:
+                    matches.append(Match(first, second, percentage))
                 continue
 
-            # First frame looks like a reasonable candidate: pull remaining samples serially.
             for idx, pos in enumerate(positions[1:], start=1):
                 sample_scores.append(
-                    _score_sample(frame_cache, first, second, idx, pos, threshold, match_scaled)
+                    _score_sample(
+                        frame_cache,
+                        first,
+                        second,
+                        idx,
+                        pos,
+                        threshold,
+                        match_scaled,
+                        prepared_blocks=deep_blocks,
+                    )
                 )
                 if _cannot_reach_threshold(sample_scores, sample_count, threshold):
                     sample_scores = []

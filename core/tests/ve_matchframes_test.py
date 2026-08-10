@@ -13,6 +13,11 @@ class _FakeVideo:
         self.is_ref = is_ref
 
 
+def _stub_prepare_blocks(files, frame_cache, sample_indices, j=None):
+    # Non-None blocks so first-pass scoring runs; contents unused when score is mocked.
+    return {(str(f.path), idx): (["block"], (64, 64)) for f in files for idx in sample_indices}
+
+
 def test_cannot_reach_threshold_after_first_low_score():
     # 5 samples, threshold 80: first score 0 => max average 80 exactly, still reachable
     assert not matchframes._cannot_reach_threshold([0], 5, 80)
@@ -70,22 +75,40 @@ def test_preload_sample_extracts_first_frames_in_parallel(monkeypatch, tmpdir):
     eq_(cache.get(files[0], 0, 0.25).name.endswith("_0.jpg"), True)
 
 
+def test_preload_samples_extracts_all_indices(monkeypatch, tmpdir):
+    calls = []
+
+    def fake_extract(video_path, output_path, timestamp_seconds, ffmpeg_path):
+        calls.append((str(video_path), round(timestamp_seconds, 3)))
+        Path(output_path).write_bytes(b"fake")
+        return True
+
+    monkeypatch.setattr(matchframes, "_extract_frame", fake_extract)
+    cache = matchframes._FrameCache(str(tmpdir), "ffmpeg")
+    files = [_FakeVideo("/videos/a.mp4", 100.0), _FakeVideo("/videos/b.mp4", 100.0)]
+    cache.preload_samples(files, [(0, 0.25), (1, 0.5), (2, 0.75)])
+    eq_(len(calls), 6)
+    cache.preload_samples(files, [(0, 0.25), (1, 0.5), (2, 0.75)])
+    eq_(len(calls), 6)  # cached
+
+
 def test_getmatches_skips_later_samples_when_first_fails(monkeypatch):
     extract_calls = []
-    compare_calls = []
+    block_compare_calls = []
 
     def fake_extract(video_path, output_path, timestamp_seconds, ffmpeg_path):
         extract_calls.append((str(video_path), round(timestamp_seconds, 3)))
         Path(output_path).write_bytes(b"fake")
         return True
 
-    def fake_compare(first_image, second_image, threshold, match_scaled):
-        compare_calls.append((str(first_image), str(second_image)))
+    def fake_block_compare(*args, **kwargs):
+        block_compare_calls.append(1)
         return 0  # first sample cannot reach threshold 90 with 5 samples
 
     monkeypatch.setattr(matchframes, "_ensure_ffmpeg_available", lambda *a, **k: None)
     monkeypatch.setattr(matchframes, "_extract_frame", fake_extract)
-    monkeypatch.setattr(matchframes, "_frame_match_percentage", fake_compare)
+    monkeypatch.setattr(matchframes, "_prepare_frame_blocks", _stub_prepare_blocks)
+    monkeypatch.setattr(matchframes, "_pair_blocks_percentage", fake_block_compare)
 
     files = [
         _FakeVideo("/videos/a.mp4", 100.0),
@@ -104,8 +127,8 @@ def test_getmatches_skips_later_samples_when_first_fails(monkeypatch):
     eq_(matches, [])
     # Only first-sample extracts (one per file); no later sample indexes.
     eq_(len(extract_calls), 3)
-    assert all(ts == round(100.0 / 6, 3) for _, ts in extract_calls)  # first of 5 interior samples
-    eq_(len(compare_calls), 3)
+    assert all(ts == round(100.0 / 6, 3) for _, ts in extract_calls)
+    eq_(len(block_compare_calls), 3)
 
 
 def test_getmatches_extracts_later_samples_only_after_first_match(monkeypatch):
@@ -116,12 +139,11 @@ def test_getmatches_extracts_later_samples_only_after_first_match(monkeypatch):
         Path(output_path).write_bytes(b"fake")
         return True
 
-    def fake_compare(first_image, second_image, threshold, match_scaled):
-        return 100
-
     monkeypatch.setattr(matchframes, "_ensure_ffmpeg_available", lambda *a, **k: None)
     monkeypatch.setattr(matchframes, "_extract_frame", fake_extract)
-    monkeypatch.setattr(matchframes, "_frame_match_percentage", fake_compare)
+    monkeypatch.setattr(matchframes, "_prepare_frame_blocks", _stub_prepare_blocks)
+    monkeypatch.setattr(matchframes, "_pair_blocks_percentage", lambda *a, **k: 100)
+    monkeypatch.setattr(matchframes, "_frame_match_percentage", lambda *a, **k: 100)
 
     files = [
         _FakeVideo("/videos/a.mp4", 100.0),
@@ -148,6 +170,38 @@ def test_getmatches_extracts_later_samples_only_after_first_match(monkeypatch):
     eq_(len(later_extracts), 4)
 
 
+def test_getmatches_preload_all_frames_extracts_upfront(monkeypatch):
+    extract_calls = []
+
+    def fake_extract(video_path, output_path, timestamp_seconds, ffmpeg_path):
+        extract_calls.append((str(video_path), round(timestamp_seconds, 3)))
+        Path(output_path).write_bytes(b"fake")
+        return True
+
+    monkeypatch.setattr(matchframes, "_ensure_ffmpeg_available", lambda *a, **k: None)
+    monkeypatch.setattr(matchframes, "_extract_frame", fake_extract)
+    monkeypatch.setattr(matchframes, "_prepare_frame_blocks", _stub_prepare_blocks)
+    monkeypatch.setattr(matchframes, "_pair_blocks_percentage", lambda *a, **k: 100)
+
+    files = [
+        _FakeVideo("/videos/a.mp4", 100.0),
+        _FakeVideo("/videos/b.mp4", 100.0),
+    ]
+    matches = matchframes.getmatches(
+        files,
+        threshold=80,
+        sample_count=3,
+        ffmpeg_path="ffmpeg",
+        ffprobe_path="ffprobe",
+        duration_tolerance_seconds=1.0,
+        match_scaled=True,
+        preload_all_frames=True,
+    )
+    eq_(len(matches), 1)
+    # All 3 samples for both videos extracted up front; deep pass uses blocks (no more extracts).
+    eq_(len(extract_calls), 6)
+
+
 def test_getmatches_skips_zero_duration(monkeypatch):
     monkeypatch.setattr(matchframes, "_ensure_ffmpeg_available", lambda *a, **k: None)
     files = [
@@ -167,19 +221,20 @@ def test_getmatches_skips_zero_duration(monkeypatch):
 
 
 def test_getmatches_skips_pairs_outside_duration_window(monkeypatch):
-    compare_calls = []
+    block_compare_calls = []
 
     def fake_extract(video_path, output_path, timestamp_seconds, ffmpeg_path):
         Path(output_path).write_bytes(b"fake")
         return True
 
-    def fake_compare(first_image, second_image, threshold, match_scaled):
-        compare_calls.append(1)
+    def fake_block_compare(*args, **kwargs):
+        block_compare_calls.append(1)
         return 100
 
     monkeypatch.setattr(matchframes, "_ensure_ffmpeg_available", lambda *a, **k: None)
     monkeypatch.setattr(matchframes, "_extract_frame", fake_extract)
-    monkeypatch.setattr(matchframes, "_frame_match_percentage", fake_compare)
+    monkeypatch.setattr(matchframes, "_prepare_frame_blocks", _stub_prepare_blocks)
+    monkeypatch.setattr(matchframes, "_pair_blocks_percentage", fake_block_compare)
 
     files = [
         _FakeVideo("/videos/short.mp4", 10.0),
@@ -198,4 +253,29 @@ def test_getmatches_skips_pairs_outside_duration_window(monkeypatch):
     # Only short vs short2 is inside the 1s window; long is never compared.
     eq_(len(matches), 1)
     eq_({matches[0].first.name, matches[0].second.name}, {"short.mp4", "short2.mp4"})
-    eq_(len(compare_calls), 1)
+    eq_(len(block_compare_calls), 1)
+
+
+def test_prepare_frame_blocks_reads_each_requested_sample(monkeypatch, tmpdir):
+    prepare_calls = []
+
+    def fake_blocks_for_frame(frame_path):
+        prepare_calls.append(str(frame_path))
+        return [(1, 2, 3)] * 4, (8, 8)
+
+    monkeypatch.setattr(matchframes, "_blocks_for_frame", fake_blocks_for_frame)
+    cache = matchframes._FrameCache(str(tmpdir), "ffmpeg")
+    files = [
+        _FakeVideo("/videos/a.mp4", 100.0),
+        _FakeVideo("/videos/b.mp4", 100.0),
+    ]
+    for f in files:
+        for idx in (0, 1):
+            out = Path(str(tmpdir)) / f"{f.name}_{idx}.jpg"
+            out.write_bytes(b"x")
+            cache._frames[(str(f.path), idx)] = out
+
+    prepared = matchframes._prepare_frame_blocks(files, cache, [0, 1])
+    eq_(len(prepare_calls), 4)
+    eq_(prepared[("/videos/a.mp4", 0)][1], (8, 8))
+    eq_(set(matchframes._first_frame_blocks_by_path(prepared)), {"/videos/a.mp4", "/videos/b.mp4"})

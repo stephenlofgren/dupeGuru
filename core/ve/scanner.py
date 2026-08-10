@@ -11,6 +11,7 @@ class ScannerVE(ScannerBase):
     ffmpeg_path = "ffmpeg"
     ffprobe_path = "ffprobe"
     video_match_scaled = True
+    preload_all_frames = False
 
     @staticmethod
     def _key_func(dupe):
@@ -41,6 +42,7 @@ class ScannerVE(ScannerBase):
                 ffprobe_path=self.ffprobe_path,
                 duration_tolerance_seconds=self.duration_tolerance_seconds,
                 match_scaled=self.video_match_scaled,
+                preload_all_frames=self.preload_all_frames,
                 j=j,
             )
         raise ValueError("Invalid scan type")

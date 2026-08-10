@@ -200,6 +200,7 @@ class DupeGuru(QObject):
         self.model.options["ffmpeg_path"] = self.prefs.video_ffmpeg_path
         self.model.options["ffprobe_path"] = self.prefs.video_ffprobe_path
         self.model.options["video_match_scaled"] = self.prefs.video_match_scaled
+        self.model.options["preload_all_frames"] = self.prefs.video_preload_all_frames
         self.model.options["include_exists_check"] = self.prefs.include_exists_check
         self.model.options["rehash_ignore_mtime"] = self.prefs.rehash_ignore_mtime
 

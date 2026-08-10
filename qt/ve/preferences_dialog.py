@@ -25,6 +25,11 @@ class PreferencesDialog(PreferencesDialogBase):
 
         self._setupAddCheckbox("videoMatchScaledBox", tr("Allow frame comparisons with different dimensions"))
         self.widgetsVLayout.addWidget(self.videoMatchScaledBox)
+        self._setupAddCheckbox(
+            "preloadAllFramesBox",
+            tr("Preload all frame samples in parallel (uses more disk, faster deep compare)"),
+        )
+        self.widgetsVLayout.addWidget(self.preloadAllFramesBox)
         self._setupAddCheckbox("mixFileKindBox", tr("Can mix file kind"))
         self.widgetsVLayout.addWidget(self.mixFileKindBox)
         self._setupAddCheckbox("useRegexpBox", tr("Use regular expressions when filtering"))
@@ -83,7 +88,9 @@ class PreferencesDialog(PreferencesDialogBase):
         self.filterHardnessSlider.setEnabled(True)
         self.sampleCountSpinBox.setEnabled(frame_scan)
         self.videoMatchScaledBox.setEnabled(frame_scan)
+        self.preloadAllFramesBox.setEnabled(frame_scan)
         setchecked(self.videoMatchScaledBox, prefs.video_match_scaled)
+        setchecked(self.preloadAllFramesBox, prefs.video_preload_all_frames)
         self.durationToleranceSpinBox.setValue(float(prefs.video_duration_tolerance))
         self.sampleCountSpinBox.setValue(int(prefs.video_frame_sample_count))
         self.ffmpegPathEdit.setText(str(prefs.video_ffmpeg_path))
@@ -91,6 +98,7 @@ class PreferencesDialog(PreferencesDialogBase):
 
     def _save(self, prefs, ischecked):
         prefs.video_match_scaled = ischecked(self.videoMatchScaledBox)
+        prefs.video_preload_all_frames = ischecked(self.preloadAllFramesBox)
         prefs.video_duration_tolerance = float(self.durationToleranceSpinBox.value())
         prefs.video_frame_sample_count = int(self.sampleCountSpinBox.value())
         prefs.video_ffmpeg_path = str(self.ffmpegPathEdit.text()).strip() or "ffmpeg"

@@ -231,6 +231,7 @@ class Preferences(PreferencesBase):
         self.video_ffmpeg_path = get("VideoFfmpegPath", self.video_ffmpeg_path)
         self.video_ffprobe_path = get("VideoFfprobePath", self.video_ffprobe_path)
         self.video_match_scaled = get("VideoMatchScaled", self.video_match_scaled)
+        self.video_preload_all_frames = get("VideoPreloadAllFrames", self.video_preload_all_frames)
 
     def reset(self):
         self.filter_hardness = 95
@@ -289,6 +290,7 @@ class Preferences(PreferencesBase):
         self.video_ffmpeg_path = "ffmpeg"
         self.video_ffprobe_path = "ffprobe"
         self.video_match_scaled = True
+        self.video_preload_all_frames = False
 
     def _save_values(self, settings):
         set_ = self.set_value
@@ -348,6 +350,7 @@ class Preferences(PreferencesBase):
         set_("VideoFfmpegPath", self.video_ffmpeg_path)
         set_("VideoFfprobePath", self.video_ffprobe_path)
         set_("VideoMatchScaled", self.video_match_scaled)
+        set_("VideoPreloadAllFrames", self.video_preload_all_frames)
 
     # scan_type is special because we save it immediately when we set it.
     def get_scan_type(self, app_mode):
