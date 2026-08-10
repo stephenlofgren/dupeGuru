@@ -1,7 +1,8 @@
 import logging
+import os
 import subprocess
 import tempfile
-from itertools import combinations
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from hscommon.jobprogress import job
@@ -11,6 +12,7 @@ from core.engine import Match
 from core.pe.block import DifferentBlockCountError, NoBlocksError, avgdiff
 from core.pe.matchblock import BLOCK_COUNT_PER_SIDE, MIN_ITERATIONS
 from core.pe import photo as pe_photo
+from core.ve.duration_window import duration_window_pair_count, iter_duration_window_pairs
 
 
 def _ensure_ffmpeg_available(ffmpeg_path, ffprobe_path):
@@ -77,6 +79,12 @@ def _cannot_reach_threshold(scores, sample_count, threshold):
     return max_possible < threshold
 
 
+def _first_frame_worker_count(file_count):
+    if file_count <= 1:
+        return 1
+    return max(1, min(file_count, (os.cpu_count() or 4) * 2))
+
+
 class _FrameCache:
     """Extract each (video, sample index) frame at most once for the whole scan."""
 
@@ -88,6 +96,7 @@ class _FrameCache:
         self._next_id = 0
 
     def get(self, video_file, sample_idx, relative_pos):
+        """Serial extract-or-reuse for later samples."""
         key = (str(video_file.path), sample_idx)
         if key in self._frames:
             return self._frames[key]
@@ -98,6 +107,49 @@ class _FrameCache:
         path = out if ok else None
         self._frames[key] = path
         return path
+
+    def preload_sample(self, files, sample_idx, relative_pos, j=job.nulljob):
+        """Extract one sample index for every video, in parallel."""
+        work = []
+        for video_file in files:
+            key = (str(video_file.path), sample_idx)
+            if key in self._frames:
+                continue
+            out = self._cache_dir / f"{self._next_id}_{sample_idx}.jpg"
+            self._next_id += 1
+            ts = video_file.duration * relative_pos
+            work.append((key, video_file.path, out, ts))
+
+        if not work:
+            return
+
+        j.start_job(len(work), tr("Extract first frame of %d/%d videos") % (0, len(work)))
+        workers = _first_frame_worker_count(len(work))
+        done = 0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(_extract_frame, path, out, ts, self._ffmpeg_path): (key, out)
+                for key, path, out, ts in work
+            }
+            for future in as_completed(futures):
+                key, out = futures[future]
+                ok = False
+                try:
+                    ok = future.result()
+                except Exception:
+                    logging.debug("First-frame extract failed for %s", key[0], exc_info=True)
+                self._frames[key] = out if ok else None
+                done += 1
+                j.set_progress(done, tr("Extract first frame of %d/%d videos") % (done, len(work)))
+
+
+def _score_sample(frame_cache, first, second, sample_idx, relative_pos, threshold, match_scaled):
+    first_frame = frame_cache.get(first, sample_idx, relative_pos)
+    second_frame = frame_cache.get(second, sample_idx, relative_pos)
+    if first_frame is None or second_frame is None:
+        logging.debug("Could not extract frame %d for %s and %s", sample_idx, first.path, second.path)
+        return 0
+    return _frame_match_percentage(first_frame, second_frame, threshold, match_scaled)
 
 
 def getmatches(
@@ -111,7 +163,7 @@ def getmatches(
     j=job.nulljob,
 ):
     _ensure_ffmpeg_available(ffmpeg_path, ffprobe_path)
-    j = j.start_subjob([2, 8])
+    j = j.start_subjob([1, 2, 7])
     for f in j.iter_with_progress(files, tr("Read duration of %d/%d videos")):
         f.duration  # force lazy ffprobe read
 
@@ -119,32 +171,33 @@ def getmatches(
     files = [f for f in files if f.duration > 0]
     positions = _sample_positions(sample_count)
     matches = []
-    pair_count = len(files) * (len(files) - 1) // 2
-    j.start_job(max(1, pair_count), tr("Compared %d/%d video pairs") % (0, pair_count))
+    pair_count = duration_window_pair_count(files, duration_tolerance_seconds)
 
     with tempfile.TemporaryDirectory(prefix="dupeguru-video-frames-") as td:
         frame_cache = _FrameCache(td, ffmpeg_path)
-        for i, (first, second) in enumerate(combinations(files, 2), start=1):
-            status = tr("Compared %d/%d video pairs (%s vs %s)") % (i, pair_count, first.name, second.name)
+        # Parallelize first-frame extracts only. Later samples stay serial and are
+        # only pulled for pairs that still look viable after the first comparison.
+        frame_cache.preload_sample(files, 0, positions[0], j=j)
+
+        for first, second in j.iter_with_progress(
+            iter_duration_window_pairs(files, duration_tolerance_seconds),
+            tr("Compared %d/%d video pairs"),
+            count=max(1, pair_count),
+            every=100,
+        ):
             if first.is_ref and second.is_ref:
-                j.set_progress(i, status)
-                continue
-            if duration_tolerance_seconds > 0 and abs(first.duration - second.duration) > duration_tolerance_seconds:
-                j.set_progress(i, status)
                 continue
 
-            sample_scores = []
-            for idx, pos in enumerate(positions):
-                first_frame = frame_cache.get(first, idx, pos)
-                second_frame = frame_cache.get(second, idx, pos)
-                if first_frame is None or second_frame is None:
-                    logging.debug("Could not extract frame %d for %s and %s", idx, first.path, second.path)
-                    # Treat failed extract as score 0 so early-exit math stays conservative.
-                    sample_scores.append(0)
-                else:
-                    sample_scores.append(
-                        _frame_match_percentage(first_frame, second_frame, threshold, match_scaled)
-                    )
+            first_score = _score_sample(frame_cache, first, second, 0, positions[0], threshold, match_scaled)
+            sample_scores = [first_score]
+            if _cannot_reach_threshold(sample_scores, sample_count, threshold):
+                continue
+
+            # First frame looks like a reasonable candidate: pull remaining samples serially.
+            for idx, pos in enumerate(positions[1:], start=1):
+                sample_scores.append(
+                    _score_sample(frame_cache, first, second, idx, pos, threshold, match_scaled)
+                )
                 if _cannot_reach_threshold(sample_scores, sample_count, threshold):
                     sample_scores = []
                     break
@@ -153,5 +206,4 @@ def getmatches(
                 percentage = int(sum(sample_scores) / len(sample_scores))
                 if percentage >= threshold:
                     matches.append(Match(first, second, percentage))
-            j.set_progress(i, status)
     return matches

@@ -45,24 +45,45 @@ def test_frame_cache_extracts_each_sample_once(monkeypatch, tmpdir):
     eq_(calls[1], ("/videos/a.mp4", 50.0))
 
 
-def test_getmatches_reuses_frames_across_pairs_and_exits_early(monkeypatch):
+def test_preload_sample_extracts_first_frames_in_parallel(monkeypatch, tmpdir):
+    calls = []
+
+    def fake_extract(video_path, output_path, timestamp_seconds, ffmpeg_path):
+        calls.append(str(video_path))
+        Path(output_path).write_bytes(b"fake")
+        return True
+
+    monkeypatch.setattr(matchframes, "_extract_frame", fake_extract)
+    monkeypatch.setattr(matchframes, "_first_frame_worker_count", lambda n: 4)
+
+    cache = matchframes._FrameCache(str(tmpdir), "ffmpeg")
+    files = [
+        _FakeVideo("/videos/a.mp4", 100.0),
+        _FakeVideo("/videos/b.mp4", 100.0),
+        _FakeVideo("/videos/c.mp4", 100.0),
+    ]
+    cache.preload_sample(files, 0, 0.25)
+    eq_(sorted(calls), ["/videos/a.mp4", "/videos/b.mp4", "/videos/c.mp4"])
+    # Second preload is a no-op (already cached).
+    cache.preload_sample(files, 0, 0.25)
+    eq_(len(calls), 3)
+    eq_(cache.get(files[0], 0, 0.25).name.endswith("_0.jpg"), True)
+
+
+def test_getmatches_skips_later_samples_when_first_fails(monkeypatch):
     extract_calls = []
     compare_calls = []
 
-    def fake_ensure(ffmpeg_path, ffprobe_path):
-        return None
-
     def fake_extract(video_path, output_path, timestamp_seconds, ffmpeg_path):
-        extract_calls.append(str(video_path))
+        extract_calls.append((str(video_path), round(timestamp_seconds, 3)))
         Path(output_path).write_bytes(b"fake")
         return True
 
     def fake_compare(first_image, second_image, threshold, match_scaled):
         compare_calls.append((str(first_image), str(second_image)))
-        # Always fail hard so early-exit triggers after first sample.
-        return 0
+        return 0  # first sample cannot reach threshold 90 with 5 samples
 
-    monkeypatch.setattr(matchframes, "_ensure_ffmpeg_available", fake_ensure)
+    monkeypatch.setattr(matchframes, "_ensure_ffmpeg_available", lambda *a, **k: None)
     monkeypatch.setattr(matchframes, "_extract_frame", fake_extract)
     monkeypatch.setattr(matchframes, "_frame_match_percentage", fake_compare)
 
@@ -71,8 +92,6 @@ def test_getmatches_reuses_frames_across_pairs_and_exits_early(monkeypatch):
         _FakeVideo("/videos/b.mp4", 100.0),
         _FakeVideo("/videos/c.mp4", 100.0),
     ]
-    # 3 files => pairs (a,b), (a,c), (b,c). sample_count=5, threshold=90
-    # Early exit after first sample (score 0) => at most 1 compare per pair.
     matches = matchframes.getmatches(
         files,
         threshold=90,
@@ -83,10 +102,50 @@ def test_getmatches_reuses_frames_across_pairs_and_exits_early(monkeypatch):
         match_scaled=True,
     )
     eq_(matches, [])
-    # Without cache: 3 pairs * 5 samples * 2 extracts = 30.
-    # With cache + early exit: each file extracted once for sample 0 only => 3.
+    # Only first-sample extracts (one per file); no later sample indexes.
     eq_(len(extract_calls), 3)
+    assert all(ts == round(100.0 / 6, 3) for _, ts in extract_calls)  # first of 5 interior samples
     eq_(len(compare_calls), 3)
+
+
+def test_getmatches_extracts_later_samples_only_after_first_match(monkeypatch):
+    extract_calls = []
+
+    def fake_extract(video_path, output_path, timestamp_seconds, ffmpeg_path):
+        extract_calls.append((str(video_path), round(timestamp_seconds, 3)))
+        Path(output_path).write_bytes(b"fake")
+        return True
+
+    def fake_compare(first_image, second_image, threshold, match_scaled):
+        return 100
+
+    monkeypatch.setattr(matchframes, "_ensure_ffmpeg_available", lambda *a, **k: None)
+    monkeypatch.setattr(matchframes, "_extract_frame", fake_extract)
+    monkeypatch.setattr(matchframes, "_frame_match_percentage", fake_compare)
+
+    files = [
+        _FakeVideo("/videos/a.mp4", 100.0),
+        _FakeVideo("/videos/b.mp4", 100.0),
+    ]
+    matches = matchframes.getmatches(
+        files,
+        threshold=80,
+        sample_count=3,
+        ffmpeg_path="ffmpeg",
+        ffprobe_path="ffprobe",
+        duration_tolerance_seconds=1.0,
+        match_scaled=True,
+    )
+    eq_(len(matches), 1)
+    eq_(matches[0].percentage, 100)
+    # First frames for both videos, then remaining 2 samples for both => 2 + 4 = 6.
+    eq_(len(extract_calls), 6)
+    first_sample_ts = round(100.0 * (1 / 4), 3)
+    later_ts = {round(100.0 * (2 / 4), 3), round(100.0 * (3 / 4), 3)}
+    first_extracts = [c for c in extract_calls if c[1] == first_sample_ts]
+    later_extracts = [c for c in extract_calls if c[1] in later_ts]
+    eq_(len(first_extracts), 2)
+    eq_(len(later_extracts), 4)
 
 
 def test_getmatches_skips_zero_duration(monkeypatch):
@@ -105,3 +164,38 @@ def test_getmatches_skips_zero_duration(monkeypatch):
         match_scaled=True,
     )
     eq_(matches, [])
+
+
+def test_getmatches_skips_pairs_outside_duration_window(monkeypatch):
+    compare_calls = []
+
+    def fake_extract(video_path, output_path, timestamp_seconds, ffmpeg_path):
+        Path(output_path).write_bytes(b"fake")
+        return True
+
+    def fake_compare(first_image, second_image, threshold, match_scaled):
+        compare_calls.append(1)
+        return 100
+
+    monkeypatch.setattr(matchframes, "_ensure_ffmpeg_available", lambda *a, **k: None)
+    monkeypatch.setattr(matchframes, "_extract_frame", fake_extract)
+    monkeypatch.setattr(matchframes, "_frame_match_percentage", fake_compare)
+
+    files = [
+        _FakeVideo("/videos/short.mp4", 10.0),
+        _FakeVideo("/videos/short2.mp4", 10.2),
+        _FakeVideo("/videos/long.mp4", 60.0),
+    ]
+    matches = matchframes.getmatches(
+        files,
+        threshold=80,
+        sample_count=1,
+        ffmpeg_path="ffmpeg",
+        ffprobe_path="ffprobe",
+        duration_tolerance_seconds=1.0,
+        match_scaled=True,
+    )
+    # Only short vs short2 is inside the 1s window; long is never compared.
+    eq_(len(matches), 1)
+    eq_({matches[0].first.name, matches[0].second.name}, {"short.mp4", "short2.mp4"})
+    eq_(len(compare_calls), 1)
