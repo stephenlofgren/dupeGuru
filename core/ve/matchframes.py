@@ -23,6 +23,7 @@ def _ensure_ffmpeg_available(ffmpeg_path, ffprobe_path):
 
 
 def _extract_frame(video_path, output_path, timestamp_seconds, ffmpeg_path):
+    # -ss before -i seeks in container (fast). jpg is cheaper to encode/decode than png.
     cmd = [
         ffmpeg_path,
         "-hide_banner",
@@ -34,6 +35,8 @@ def _extract_frame(video_path, output_path, timestamp_seconds, ffmpeg_path):
         str(video_path),
         "-frames:v",
         "1",
+        "-q:v",
+        "2",
         "-y",
         str(output_path),
     ]
@@ -65,6 +68,38 @@ def _sample_positions(sample_count):
     return [(i + 1) / (sample_count + 1) for i in range(sample_count)]
 
 
+def _cannot_reach_threshold(scores, sample_count, threshold):
+    """True if even perfect remaining samples cannot push the mean to threshold."""
+    remaining = sample_count - len(scores)
+    if remaining < 0:
+        return True
+    max_possible = (sum(scores) + 100 * remaining) / sample_count
+    return max_possible < threshold
+
+
+class _FrameCache:
+    """Extract each (video, sample index) frame at most once for the whole scan."""
+
+    def __init__(self, cache_dir, ffmpeg_path):
+        self._cache_dir = Path(cache_dir)
+        self._ffmpeg_path = ffmpeg_path
+        # (path_str, sample_idx) -> Path | None (None = extraction failed)
+        self._frames = {}
+        self._next_id = 0
+
+    def get(self, video_file, sample_idx, relative_pos):
+        key = (str(video_file.path), sample_idx)
+        if key in self._frames:
+            return self._frames[key]
+        out = self._cache_dir / f"{self._next_id}_{sample_idx}.jpg"
+        self._next_id += 1
+        ts = video_file.duration * relative_pos
+        ok = _extract_frame(video_file.path, out, ts, self._ffmpeg_path)
+        path = out if ok else None
+        self._frames[key] = path
+        return path
+
+
 def getmatches(
     files,
     threshold,
@@ -80,34 +115,43 @@ def getmatches(
     for f in j.iter_with_progress(files, tr("Read duration of %d/%d videos")):
         f.duration  # force lazy ffprobe read
 
+    # Zero-duration / failed probes cannot produce useful frame matches.
+    files = [f for f in files if f.duration > 0]
+    positions = _sample_positions(sample_count)
     matches = []
     pair_count = len(files) * (len(files) - 1) // 2
     j.start_job(max(1, pair_count), tr("Compared %d/%d video pairs") % (0, pair_count))
-    for i, (first, second) in enumerate(combinations(files, 2), start=1):
-        status = tr("Compared %d/%d video pairs (%s vs %s)") % (i, pair_count, first.name, second.name)
-        if first.is_ref and second.is_ref:
-            j.set_progress(i, status)
-            continue
-        if duration_tolerance_seconds > 0 and abs(first.duration - second.duration) > duration_tolerance_seconds:
-            j.set_progress(i, status)
-            continue
-        sample_scores = []
-        duration = min(first.duration, second.duration)
-        with tempfile.TemporaryDirectory(prefix="dupeguru-video-frames-") as td:
-            tmp_dir = Path(td)
-            for idx, pos in enumerate(_sample_positions(sample_count)):
-                ts = duration * pos
-                first_frame = tmp_dir / f"first_{idx}.png"
-                second_frame = tmp_dir / f"second_{idx}.png"
-                ok_first = _extract_frame(first.path, first_frame, ts, ffmpeg_path)
-                ok_second = _extract_frame(second.path, second_frame, ts, ffmpeg_path)
-                if not ok_first or not ok_second:
+
+    with tempfile.TemporaryDirectory(prefix="dupeguru-video-frames-") as td:
+        frame_cache = _FrameCache(td, ffmpeg_path)
+        for i, (first, second) in enumerate(combinations(files, 2), start=1):
+            status = tr("Compared %d/%d video pairs (%s vs %s)") % (i, pair_count, first.name, second.name)
+            if first.is_ref and second.is_ref:
+                j.set_progress(i, status)
+                continue
+            if duration_tolerance_seconds > 0 and abs(first.duration - second.duration) > duration_tolerance_seconds:
+                j.set_progress(i, status)
+                continue
+
+            sample_scores = []
+            for idx, pos in enumerate(positions):
+                first_frame = frame_cache.get(first, idx, pos)
+                second_frame = frame_cache.get(second, idx, pos)
+                if first_frame is None or second_frame is None:
                     logging.debug("Could not extract frame %d for %s and %s", idx, first.path, second.path)
-                    continue
-                sample_scores.append(_frame_match_percentage(first_frame, second_frame, threshold, match_scaled))
-        if sample_scores:
-            percentage = int(sum(sample_scores) / len(sample_scores))
-            if percentage >= threshold:
-                matches.append(Match(first, second, percentage))
-        j.set_progress(i, status)
+                    # Treat failed extract as score 0 so early-exit math stays conservative.
+                    sample_scores.append(0)
+                else:
+                    sample_scores.append(
+                        _frame_match_percentage(first_frame, second_frame, threshold, match_scaled)
+                    )
+                if _cannot_reach_threshold(sample_scores, sample_count, threshold):
+                    sample_scores = []
+                    break
+
+            if sample_scores and len(sample_scores) == sample_count:
+                percentage = int(sum(sample_scores) / len(sample_scores))
+                if percentage >= threshold:
+                    matches.append(Match(first, second, percentage))
+            j.set_progress(i, status)
     return matches
