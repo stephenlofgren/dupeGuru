@@ -18,6 +18,20 @@ def _stub_prepare_blocks(files, frame_cache, sample_indices, j=None):
     return {(str(f.path), idx): (["block"], (64, 64)) for f in files for idx in sample_indices}
 
 
+def test_pair_blocks_percentage_abort_is_zero_not_threshold_minus_one():
+    from PIL import Image
+
+    from core.pe.block import getblocks2
+    from core.pe.matchblock import BLOCK_COUNT_PER_SIDE
+
+    red = getblocks2(Image.new("RGB", (300, 300), (255, 0, 0)), BLOCK_COUNT_PER_SIDE)
+    blue = getblocks2(Image.new("RGB", (300, 300), (0, 0, 255)), BLOCK_COUNT_PER_SIDE)
+    # Unrelated frames must not score threshold-1 (the old avgdiff abort floor).
+    eq_(matchframes._pair_blocks_percentage(red, (300, 300), blue, (300, 300), 80, True), 0)
+    eq_(matchframes._pair_blocks_percentage(red, (300, 300), blue, (300, 300), 90, True), 0)
+    eq_(matchframes._pair_blocks_percentage(red, (300, 300), red, (300, 300), 80, True), 100)
+
+
 def test_cannot_reach_threshold_after_first_low_score():
     # 5 samples, threshold 80: first score 0 => max average 80 exactly, still reachable
     assert not matchframes._cannot_reach_threshold([0], 5, 80)
@@ -129,6 +143,37 @@ def test_getmatches_skips_later_samples_when_first_fails(monkeypatch):
     eq_(len(extract_calls), 3)
     assert all(ts == round(100.0 / 6, 3) for _, ts in extract_calls)
     eq_(len(block_compare_calls), 3)
+
+
+def test_getmatches_first_frame_reject_does_not_average_into_match(monkeypatch):
+    extract_calls = []
+
+    def fake_extract(video_path, output_path, timestamp_seconds, ffmpeg_path):
+        extract_calls.append(str(video_path))
+        Path(output_path).write_bytes(b"fake")
+        return True
+
+    monkeypatch.setattr(matchframes, "_ensure_ffmpeg_available", lambda *a, **k: None)
+    monkeypatch.setattr(matchframes, "_extract_frame", fake_extract)
+    monkeypatch.setattr(matchframes, "_prepare_frame_blocks", _stub_prepare_blocks)
+    # Old bug: abort scored 79, then one later 94 averaged to 82 and matched.
+    monkeypatch.setattr(matchframes, "_pair_blocks_percentage", lambda *a, **k: 0)
+
+    files = [
+        _FakeVideo("/videos/a.mp4", 100.0),
+        _FakeVideo("/videos/b.mp4", 100.0),
+    ]
+    matches = matchframes.getmatches(
+        files,
+        threshold=80,
+        sample_count=5,
+        ffmpeg_path="ffmpeg",
+        ffprobe_path="ffprobe",
+        duration_tolerance_seconds=1.0,
+        match_scaled=True,
+    )
+    eq_(matches, [])
+    eq_(len(extract_calls), 2)  # first sample only; pair never goes to deep compare
 
 
 def test_getmatches_extracts_later_samples_only_after_first_match(monkeypatch):

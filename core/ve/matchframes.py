@@ -69,7 +69,13 @@ def _pair_blocks_percentage(first_blocks, first_dims, second_blocks, second_dims
     if not match_scaled and first_dims != second_dims:
         return 0
     try:
-        diff = avgdiff(first_blocks, second_blocks, 100 - threshold, MIN_ITERATIONS)
+        # avgdiff aborts with limit+1 when frames are too different. That is a reject, not a
+        # similarity of (threshold - 1); treating it as 79% (at threshold 80) made unrelated
+        # videos look like matches once several samples were averaged.
+        limit = 100 - threshold
+        diff = avgdiff(first_blocks, second_blocks, limit, MIN_ITERATIONS)
+        if diff > limit:
+            return 0
         return max(0, 100 - diff)
     except (DifferentBlockCountError, NoBlocksError, OSError, ValueError):
         return 0
@@ -270,7 +276,8 @@ def _score_first_frame_pairs(
                         progress,
                         tr("Compared %d/%d first-frame pairs") % (progress, pair_count),
                     )
-                if not _cannot_reach_threshold([score], sample_count, threshold):
+                # First sample must itself pass the threshold. A reject (0) is not "almost 80%".
+                if score >= threshold and not _cannot_reach_threshold([score], sample_count, threshold):
                     viable.append((first, second, score))
         if done < pair_count:
             j.set_progress(pair_count, tr("Compared %d/%d first-frame pairs") % (pair_count, pair_count))
